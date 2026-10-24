@@ -28,6 +28,7 @@ INSERT INTO tpcds.config (key, value) VALUES
     ('scale_factor', ''),
     ('parallel', ''),
     ('workers', ''),
+    ('delete_after_load', ''),
     ('gpfdist_base_port', ''),
     ('optimizer', ''),
     ('timeout_sec', '');
@@ -385,6 +386,9 @@ BEGIN
     UNION ALL
     SELECT 'workers',
            COALESCE(NULLIF((SELECT c.value FROM tpcds.config c WHERE c.key = 'workers'), ''), '(not set)')
+    UNION ALL
+    SELECT 'delete_after_load',
+           COALESCE(NULLIF((SELECT c.value FROM tpcds.config c WHERE c.key = 'delete_after_load'), ''), 'false')
     UNION ALL
     SELECT 'dist_mode',
            COALESCE(NULLIF((SELECT c.value FROM tpcds.config c WHERE c.key = 'dist_mode'), ''), 'smart')
@@ -1780,6 +1784,8 @@ DECLARE
         'catalog_sales','store_sales'
     ];
     _data_subdir  TEXT;
+    _delete_after_load BOOLEAN := false;
+    _rm_lines     TEXT[] := ARRAY[]::TEXT[];
     _base_port    INTEGER;
     _rec          RECORD;
     _seg_hosts    TEXT[];
@@ -1847,6 +1853,28 @@ BEGIN
     FROM tpcds.config WHERE key = 'data_subdir';
     IF _data_subdir IS NULL THEN
         _data_subdir := 'dsgendata_tpcds';
+    END IF;
+
+    -- delete_after_load: remove a table's .dat files on every segment as soon
+    -- as that table is loaded, so the generated flat files and the loaded
+    -- tables never have to fit on disk at the same time.
+    SELECT COALESCE(NULLIF(value, ''), 'false')::BOOLEAN INTO _delete_after_load
+    FROM tpcds.config WHERE key = 'delete_after_load';
+    _delete_after_load := coalesce(_delete_after_load, false);
+    IF _delete_after_load THEN
+        FOR _rec IN
+            SELECT g.hostname,
+                   string_agg(format('%s/%s/${1}_[0-9]*_[0-9]*.dat', g.datadir, _data_subdir),
+                              ' ' ORDER BY g.content) AS globs
+            FROM gp_segment_configuration g
+            WHERE g.content >= 0 AND g.role = 'p'
+            GROUP BY g.hostname
+            ORDER BY g.hostname
+        LOOP
+            _rm_lines := _rm_lines || ARRAY[format(
+                '    ssh -o StrictHostKeyChecking=no %s "rm -f %s" 2>/dev/null',
+                _rec.hostname, _rec.globs)];
+        END LOOP;
     END IF;
 
     -- Auto-select base port: 20000 + (pid % 10000), or use config override
@@ -2035,6 +2063,13 @@ BEGIN
         'ERR="' || _errfile || '"',
         'PROGRESS="' || _progress || '"',
         'rm -f "$ERR" "$PROGRESS"',
+        'DELETE_AFTER_LOAD=' || _delete_after_load::TEXT,
+        '',
+        '# rm_dat <table>: remove the table''s .dat files on every segment host',
+        'rm_dat() {'
+    ] || _rm_lines || ARRAY[
+        '    echo "  RM   $1 .dat files removed" | tee -a "$LOG"',
+        '}',
         '',
         'run_load() {',
         '    local tbl=$1 t0=$(date +%s)',
@@ -2043,6 +2078,7 @@ BEGIN
         '    if [ $rc -ne 0 ]; then echo "$tbl" >> "$ERR"; fi',
         '    echo "  LOAD $tbl ${e}s $([ $rc -eq 0 ] && echo OK || echo FAILED)" | tee -a "$LOG"',
         '    echo "LOAD $tbl $rc $e" >> "$PROGRESS"',
+        '    if [ $rc -eq 0 ] && [ "$DELETE_AFTER_LOAD" = "true" ]; then rm_dat $tbl; fi',
         '}',
         '',
         'echo "=== TPC-DS load started: workers=' || workers || ', $(date) ===" | tee "$LOG"'

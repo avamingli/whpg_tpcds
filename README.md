@@ -286,6 +286,7 @@ SELECT tpcds.config('storage_type', 'aocs');
 | `compress_level` | `5` | Compression level for `ao`/`aocs` tables (`1` matches the RunningJon/degaurab TPC-DS kit) |
 | `compress_tables` | `large` | `large`: compress only `catalog_sales`, `inventory`, `store_sales`, `web_sales`; `all`: compress every table |
 | `workers` | `4` | Parallel INSERT workers for loading |
+| `delete_after_load` | `false` | Remove a table's `.dat` files on all segments as soon as it is loaded, so flat files and loaded tables need not fit on disk together |
 | `optimizer` | *(auto)* | Force `orca` or `postgres` for benchmark |
 | `timeout_sec` | *(none)* | Per-query timeout in seconds |
 
@@ -297,7 +298,7 @@ Path settings (auto-detected, override if needed): `tpcds_dir`, `data_dir`, `que
 
 2. **gen_data** — Launches `dsdgen` on every segment host. All workers for a host are batched into a single shell script, sent via one SSH call — no sequential overhead. Each worker writes `.dat` files to its segment's local data directory.
 
-3. **load_data** — Starts **one gpfdist per segment** (not per host), each serving its own data directory. Creates external tables pointing to all gpfdist instances. Runs parallel `INSERT INTO ... SELECT FROM` with configurable concurrency. Empty sentinel files are auto-created for small tables that only exist on certain segments. After loading, **automatically runs `ANALYZE`** on all 25 tables in parallel.
+3. **load_data** — Starts **one gpfdist per segment** (not per host), each serving its own data directory. Creates external tables pointing to all gpfdist instances. Runs parallel `INSERT INTO ... SELECT FROM` with configurable concurrency. Empty sentinel files are auto-created for small tables that only exist on certain segments. With `delete_after_load = true` each table's `.dat` files are removed as soon as that table is loaded. After loading, **automatically runs `ANALYZE`** on all 25 tables in parallel.
 
 4. **gen_query** — Runs `dsqgen` for all 99 templates and patches the output for WarehousePG compatibility.
 
