@@ -281,7 +281,10 @@ SELECT tpcds.config('storage_type', 'aocs');
 | `scale_factor` | `1` | TPC-DS scale factor (GB of raw data) |
 | `parallel` | `2` | dsdgen workers per segment |
 | `storage_type` | `aocs` | Table storage: `heap`, `ao`, `aocs` |
-| `use_partition` | `false` | Range-partition fact tables by date |
+| `use_partition` | `true` | Range-partition the fact tables by date |
+| `compress_type` | `zstd` | Compression type for `ao`/`aocs` tables |
+| `compress_level` | `5` | Compression level for `ao`/`aocs` tables (`1` matches the RunningJon/degaurab TPC-DS kit) |
+| `compress_tables` | `large` | `large`: compress only `catalog_sales`, `inventory`, `store_sales`, `web_sales`; `all`: compress every table |
 | `workers` | `4` | Parallel INSERT workers for loading |
 | `optimizer` | *(auto)* | Force `orca` or `postgres` for benchmark |
 | `timeout_sec` | *(none)* | Per-query timeout in seconds |
@@ -290,7 +293,7 @@ Path settings (auto-detected, override if needed): `tpcds_dir`, `data_dir`, `que
 
 ## How It Works
 
-1. **gen_schema** — Creates all 25 TPC-DS tables with chosen storage type (heap/AO/AOCS with zstd compression). Optionally range-partitions large fact tables.
+1. **gen_schema** — Creates all 25 TPC-DS tables with the chosen storage type (heap/AO/AOCS). By default only the four big fact tables are compressed (zstd level 5) and the fact tables are range-partitioned by date, matching the common Greenplum TPC-DS kits; see `compress_*` and `use_partition`.
 
 2. **gen_data** — Launches `dsdgen` on every segment host. All workers for a host are batched into a single shell script, sent via one SSH call — no sequential overhead. Each worker writes `.dat` files to its segment's local data directory.
 

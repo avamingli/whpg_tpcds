@@ -20,8 +20,11 @@ INSERT INTO tpcds.config (key, value) VALUES
     ('query_dir', ''),
     ('results_dir', ''),
     ('tmp_dir', ''),
-    ('use_partition', 'false'),
+    ('use_partition', 'true'),
     ('storage_type', ''),
+    ('compress_type', ''),
+    ('compress_level', ''),
+    ('compress_tables', ''),
     ('scale_factor', ''),
     ('parallel', ''),
     ('workers', ''),
@@ -363,10 +366,19 @@ BEGIN
     SELECT 'tmp_dir', tpcds._resolve_tmp_dir()
     UNION ALL
     SELECT 'use_partition',
-           COALESCE(NULLIF((SELECT c.value FROM tpcds.config c WHERE c.key = 'use_partition'), ''), 'false')
+           COALESCE(NULLIF((SELECT c.value FROM tpcds.config c WHERE c.key = 'use_partition'), ''), 'true')
     UNION ALL
     SELECT 'storage_type',
            COALESCE(NULLIF((SELECT c.value FROM tpcds.config c WHERE c.key = 'storage_type'), ''), '(not set)')
+    UNION ALL
+    SELECT 'compress_type',
+           COALESCE(NULLIF((SELECT c.value FROM tpcds.config c WHERE c.key = 'compress_type'), ''), 'zstd')
+    UNION ALL
+    SELECT 'compress_level',
+           COALESCE(NULLIF((SELECT c.value FROM tpcds.config c WHERE c.key = 'compress_level'), ''), '5')
+    UNION ALL
+    SELECT 'compress_tables',
+           COALESCE(NULLIF((SELECT c.value FROM tpcds.config c WHERE c.key = 'compress_tables'), ''), 'large')
     UNION ALL
     SELECT 'parallel',
            COALESCE(NULLIF((SELECT c.value FROM tpcds.config c WHERE c.key = 'parallel'), ''), '(not set)')
@@ -793,6 +805,11 @@ DECLARE
     ];
     _storage_type TEXT;
     _with_clause TEXT := '';
+    _with_large TEXT := '';
+    _orientation TEXT;
+    _compress_type TEXT;
+    _compress_level INTEGER;
+    _compress_tables TEXT;
     _use_partition BOOLEAN;
     _dist_mode TEXT;
     _part TEXT;
@@ -809,23 +826,49 @@ BEGIN
         RAISE EXCEPTION 'Invalid storage_type "%". Use heap, ao, or aocs.', p_storage_type;
     END IF;
 
-    IF _storage_type = 'ao' THEN
-        _with_clause := ' WITH (appendoptimized=true, orientation=row, compresstype=zstd, compresslevel=5)';
-    ELSIF _storage_type = 'aocs' THEN
-        _with_clause := ' WITH (appendoptimized=true, orientation=column, compresstype=zstd, compresslevel=5)';
+    -- Compression (ao/aocs only):
+    --   compress_type   : compresstype (default zstd)
+    --   compress_level  : compresslevel (default 5; use 1 to match the
+    --                     RunningJon/degaurab TPC-DS kit)
+    --   compress_tables : 'large' (default) compresses only the four big fact
+    --                     tables (catalog_sales, inventory, store_sales,
+    --                     web_sales) and leaves the other tables plain
+    --                     append-optimized; 'all' compresses every table.
+    SELECT NULLIF(value, '') INTO _compress_type FROM tpcds.config WHERE key = 'compress_type';
+    _compress_type := lower(coalesce(_compress_type, 'zstd'));
+    SELECT NULLIF(value, '')::INTEGER INTO _compress_level FROM tpcds.config WHERE key = 'compress_level';
+    _compress_level := coalesce(_compress_level, 5);
+    SELECT NULLIF(value, '') INTO _compress_tables FROM tpcds.config WHERE key = 'compress_tables';
+    _compress_tables := lower(coalesce(_compress_tables, 'large'));
+    IF _compress_tables NOT IN ('large', 'all') THEN
+        RAISE EXCEPTION 'Invalid compress_tables "%". Use large or all.', _compress_tables;
     END IF;
+
+    IF _storage_type <> 'heap' THEN
+        _orientation := CASE WHEN _storage_type = 'ao' THEN 'row' ELSE 'column' END;
+        _with_large := format(' WITH (appendoptimized=true, orientation=%s, compresstype=%s, compresslevel=%s)',
+                              _orientation, _compress_type, _compress_level);
+        IF _compress_tables = 'all' THEN
+            _with_clause := _with_large;
+        ELSE
+            _with_clause := format(' WITH (appendoptimized=true, orientation=%s)', _orientation);
+        END IF;
+    END IF;
+    PERFORM tpcds.config('compress_type', _compress_type);
+    PERFORM tpcds.config('compress_level', _compress_level::TEXT);
+    PERFORM tpcds.config('compress_tables', _compress_tables);
 
     -- Save storage_type to config
     PERFORM tpcds.config('storage_type', _storage_type);
 
-    -- Resolve use_partition: param → config → false
+    -- Resolve use_partition: param → config → true
     IF p_use_partition IS NOT NULL THEN
         _use_partition := p_use_partition;
     ELSE
-        SELECT COALESCE(NULLIF(value, ''), 'false')::BOOLEAN INTO _use_partition
+        SELECT COALESCE(NULLIF(value, ''), 'true')::BOOLEAN INTO _use_partition
         FROM tpcds.config WHERE key = 'use_partition';
         IF _use_partition IS NULL THEN
-            _use_partition := false;
+            _use_partition := true;
         END IF;
     END IF;
     PERFORM tpcds.config('use_partition', _use_partition::TEXT);
@@ -1306,7 +1349,7 @@ CREATE TABLE tpcds.inventory (
     inv_item_sk               integer               not null,
     inv_warehouse_sk          integer               not null,
     inv_quantity_on_hand      integer
-)$col$ || _with_clause || tpcds._get_dist('inventory', 'inv_item_sk', false, _dist_mode) || _part;
+)$col$ || _with_large || tpcds._get_dist('inventory', 'inv_item_sk', false, _dist_mode) || _part;
     EXECUTE _ddl;
 
     -- =========================================================================
@@ -1430,7 +1473,7 @@ CREATE TABLE tpcds.web_sales (
     ws_net_paid_inc_ship      decimal(7,2),
     ws_net_paid_inc_ship_tax  decimal(7,2),
     ws_net_profit             decimal(7,2)
-)$col$ || _with_clause || tpcds._get_dist('web_sales', 'ws_item_sk', false, _dist_mode) || _part;
+)$col$ || _with_large || tpcds._get_dist('web_sales', 'ws_item_sk', false, _dist_mode) || _part;
     EXECUTE _ddl;
 
     -- =========================================================================
@@ -1477,7 +1520,7 @@ CREATE TABLE tpcds.catalog_sales (
     cs_net_paid_inc_ship      decimal(7,2),
     cs_net_paid_inc_ship_tax  decimal(7,2),
     cs_net_profit             decimal(7,2)
-)$col$ || _with_clause || tpcds._get_dist('catalog_sales', 'cs_item_sk', false, _dist_mode) || _part;
+)$col$ || _with_large || tpcds._get_dist('catalog_sales', 'cs_item_sk', false, _dist_mode) || _part;
     EXECUTE _ddl;
 
     -- =========================================================================
@@ -1513,7 +1556,7 @@ CREATE TABLE tpcds.store_sales (
     ss_net_paid               decimal(7,2),
     ss_net_paid_inc_tax       decimal(7,2),
     ss_net_profit             decimal(7,2)
-)$col$ || _with_clause || tpcds._get_dist('store_sales', 'ss_item_sk', false, _dist_mode) || _part;
+)$col$ || _with_large || tpcds._get_dist('store_sales', 'ss_item_sk', false, _dist_mode) || _part;
     EXECUTE _ddl;
 
     RETURN format('Created 25 TPC-DS tables in tpcds schema (storage=%s, partition=%s)',
