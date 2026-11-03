@@ -1786,6 +1786,7 @@ DECLARE
     _data_subdir  TEXT;
     _delete_after_load BOOLEAN := false;
     _rm_lines     TEXT[] := ARRAY[]::TEXT[];
+    _stop_lines   TEXT[] := ARRAY[]::TEXT[];
     _base_port    INTEGER;
     _rec          RECORD;
     _seg_hosts    TEXT[];
@@ -1808,6 +1809,7 @@ DECLARE
     _setup_lines  TEXT[];
     _total_rows   BIGINT;
     _env_file     TEXT;
+    _env_name     TEXT;
     _gphome       TEXT;
     _gpfdist_lines  TEXT[];
     _gpfdist_sh     TEXT;
@@ -1905,16 +1907,18 @@ BEGIN
     SELECT setting INTO _gphome FROM pg_config() WHERE name = 'BINDIR';
     _gphome := regexp_replace(_gphome, '/bin$', '');
 
-    -- Try to find the environment file (WarehousePG and Greenplum both ship greenplum_path.sh)
+    -- Try to find the environment file (WarehousePG and Greenplum ship greenplum_path.sh,
+    -- Cloudberry ships cloudberry-env.sh)
     _env_file := '';
-    IF _env_file = '' THEN
+    FOREACH _env_name IN ARRAY ARRAY['greenplum_path.sh', 'cloudberry-env.sh'] LOOP
         BEGIN
             EXECUTE format('COPY (SELECT 1) TO PROGRAM %L',
-                format('test -f %s/greenplum_path.sh', _gphome));
-            _env_file := _gphome || '/greenplum_path.sh';
+                format('test -f %s/%s', _gphome, _env_name));
+            _env_file := _gphome || '/' || _env_name;
+            EXIT;
         EXCEPTION WHEN OTHERS THEN NULL;
         END;
-    END IF;
+    END LOOP;
 
     -- Get distinct segment hosts
     SELECT array_agg(DISTINCT hostname ORDER BY hostname) INTO _seg_hosts
@@ -1944,8 +1948,9 @@ BEGIN
             _gpfdist_lines := _gpfdist_lines || ARRAY[format('source %s', _env_file)];
         END IF;
 
-        -- Kill any existing gpfdist
-        _gpfdist_lines := _gpfdist_lines || ARRAY['pkill -f "gpfdist.*tpcds" 2>/dev/null || true'];
+        -- Kill any existing gpfdist (anchored so it cannot match a shell whose
+        -- command line merely mentions gpfdist and tpcds)
+        _gpfdist_lines := _gpfdist_lines || ARRAY['pkill -f "^gpfdist .*tpcds" 2>/dev/null || true'];
         _gpfdist_lines := _gpfdist_lines || ARRAY['sleep 1'];
         _gpfdist_lines := _gpfdist_lines || ARRAY[format('mkdir -p %s', _host_tmp)];
 
@@ -1964,19 +1969,37 @@ BEGIN
                 _rec.datadir, _data_subdir,
                 _rec.datadir, _data_subdir)];
 
-            -- Auto-select port with retry
+            -- Auto-select port with retry. Skip ports held by any local TCP socket,
+            -- not just listeners: the base port can fall inside ip_local_port_range
+            -- and be taken by an outbound connection, which makes gpfdist's IPv4
+            -- bind fail. Only record the port once gpfdist accepts connections on
+            -- <host>:PORT, the address the segments will use.
             _gpfdist_lines := _gpfdist_lines || ARRAY[
                 format('PORT=%s', _port),
+                'OK=0',
                 'for attempt in $(seq 1 20); do',
-                '    if ss -tln 2>/dev/null | grep -qw ":$PORT"; then',
+                '    if [ -n "$(ss -tanH "sport = :$PORT" 2>/dev/null)" ]; then',
                 '        PORT=$((PORT + 1))',
-                '    else',
-                '        break',
+                '        continue',
                 '    fi',
+                format('    nohup gpfdist -d %s/%s -p $PORT </dev/null >%s/gpfdist_seg%s_%s.log 2>&1 &',
+                       _rec.datadir, _data_subdir, _host_tmp, _rec.seg_id, _pid),
+                '    GPID=$!',
+                '    for i in $(seq 1 50); do',
+                format('        if (exec 3<>/dev/tcp/%s/$PORT) 2>/dev/null; then OK=1; break; fi', _host),
+                '        kill -0 $GPID 2>/dev/null || break',
+                '        sleep 0.1',
+                '    done',
+                '    [ $OK -eq 1 ] && break',
+                '    kill $GPID 2>/dev/null',
+                '    PORT=$((PORT + 1))',
                 'done',
-                format('echo $PORT > %s/gpfdist_seg%s_%s.port', _host_tmp, _rec.seg_id, _pid),
-                format('nohup gpfdist -d %s/%s -p $PORT </dev/null >%s/gpfdist_seg%s_%s.log 2>&1 &',
-                       _rec.datadir, _data_subdir, _host_tmp, _rec.seg_id, _pid)
+                'if [ $OK -eq 1 ]; then',
+                format('    echo $PORT > %s/gpfdist_seg%s_%s.port', _host_tmp, _rec.seg_id, _pid),
+                'else',
+                format('    echo "gpfdist: seg%s failed to start on %s (tried ports %s-$((PORT - 1))), see %s/gpfdist_seg%s_%s.log" >&2',
+                       _rec.seg_id, _host, _port, _host_tmp, _rec.seg_id, _pid),
+                'fi'
             ];
 
             -- LOCATION placeholder per segment
@@ -2053,6 +2076,12 @@ BEGIN
     -- Phase 3: Build and execute shell script for parallel load
     -- =====================================================================
     _main_sh := _tmp_dir || '/tpcds_' || _pid || '_load.sh';
+    FOREACH _host IN ARRAY _seg_hosts LOOP
+        _host_tmp := tpcds._host_tmp_dir(_host);
+        _stop_lines := _stop_lines || ARRAY[format(
+            '    ssh -o StrictHostKeyChecking=no %s "pkill -f ''^gpfdist .*tpcds'' || true; rm -f %s/gpfdist_seg*_%s.port %s/gpfdist_seg*_%s.log %s/tpcds_%s_gpfdist_%s.sh" 2>/dev/null || true',
+            _host, _host_tmp, _pid, _host_tmp, _pid, _host_tmp, _pid, _host)];
+    END LOOP;
     _script := ARRAY[
         '#!/bin/bash',
         '# Unset proxy to prevent interference with gpfdist connections',
@@ -2069,6 +2098,11 @@ BEGIN
         'rm_dat() {'
     ] || _rm_lines || ARRAY[
         '    echo "  RM   $1 .dat files removed" | tee -a "$LOG"',
+        '}',
+        '',
+        '# stop_gpfdist: stop gpfdist and remove its files on every segment host',
+        'stop_gpfdist() {'
+    ] || _stop_lines || ARRAY[
         '}',
         '',
         'run_load() {',
@@ -2108,10 +2142,20 @@ BEGIN
             'ACTUAL_PORT_seg%s=$(ssh -o StrictHostKeyChecking=no %s cat %s/gpfdist_seg%s_%s.port)',
             _rec.seg_id, _rec.hostname, _host_tmp, _rec.seg_id, _pid)];
         _script := _script || ARRAY[format(
+            'if [ -z "$ACTUAL_PORT_seg%s" ]; then echo "GPFDIST FAILED: seg%s on %s" | tee -a "$LOG"; GPFDIST_FAILED=1; fi',
+            _rec.seg_id, _rec.seg_id, _rec.hostname)];
+        _script := _script || ARRAY[format(
             'sed -i "s/__PORT_seg%s__/$ACTUAL_PORT_seg%s/g" "%s"',
             _rec.seg_id, _rec.seg_id, _setup_sql)];
     END LOOP;
-    _script := _script || ARRAY['echo "gpfdist ports resolved" | tee -a "$LOG"'];
+    -- Bail out before the setup SQL truncates anything
+    _script := _script || ARRAY[
+        'if [ -n "$GPFDIST_FAILED" ]; then',
+        '    stop_gpfdist',
+        '    echo "GPFDIST_ERROR" >> "$PROGRESS"',
+        '    exit 1',
+        'fi',
+        'echo "gpfdist ports resolved" | tee -a "$LOG"'];
 
     -- Setup SQL
     _script := _script || ARRAY[
@@ -2154,13 +2198,7 @@ BEGIN
     _script := _script || ARRAY['wait'];
 
     -- Stop gpfdist and clean up
-    _script := _script || ARRAY['', '# Stop gpfdist and clean up'];
-    FOREACH _host IN ARRAY _seg_hosts LOOP
-        _host_tmp := tpcds._host_tmp_dir(_host);
-        _script := _script || ARRAY[format(
-            'ssh -o StrictHostKeyChecking=no %s "pkill -f gpfdist.*tpcds || true; rm -f %s/gpfdist_seg*_%s.port %s/gpfdist_seg*_%s.log %s/tpcds_%s_gpfdist_%s.sh" 2>/dev/null || true',
-            _host, _host_tmp, _pid, _host_tmp, _pid, _host_tmp, _pid, _host)];
-    END LOOP;
+    _script := _script || ARRAY['', '# Stop gpfdist and clean up', 'stop_gpfdist'];
 
     _script := _script || ARRAY[
         '',
@@ -2235,6 +2273,9 @@ BEGIN
         -- Check completion or error
         IF EXISTS (SELECT 1 FROM _load_prog WHERE line = 'ALL_DONE') THEN
             EXIT;
+        END IF;
+        IF EXISTS (SELECT 1 FROM _load_prog WHERE line = 'GPFDIST_ERROR') THEN
+            RAISE EXCEPTION 'load_data: gpfdist failed to start, no table was truncated. Check log: %', _logfile;
         END IF;
         IF EXISTS (SELECT 1 FROM _load_prog WHERE line = 'LOAD_ERROR') THEN
             RAISE EXCEPTION 'load_data: some tables failed to load. Check log: %', _logfile;

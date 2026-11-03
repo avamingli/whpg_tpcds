@@ -292,6 +292,8 @@ SELECT tpcds.config('storage_type', 'aocs');
 
 Path settings (auto-detected, override if needed): `tpcds_dir`, `data_dir`, `query_dir`, `results_dir`, `tmp_dir`, `gpfdist_base_port`.
 
+`load_data` starts gpfdist at `gpfdist_base_port` (default `20000 + backend pid % 10000`) and moves to the next port while one is held by any local TCP socket, or when gpfdist does not accept connections on it.
+
 ## How It Works
 
 1. **gen_schema** — Creates all 25 TPC-DS tables with the chosen storage type (heap/AO/AOCS). By default only the four big fact tables are compressed (zstd level 5) and the fact tables are range-partitioned by date, matching the common Greenplum TPC-DS kits; see `compress_*` and `use_partition`.
