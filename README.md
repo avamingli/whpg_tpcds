@@ -112,8 +112,12 @@ SELECT tpcds.load_data(16);
 --    Scale defaults to gen_data's scale_factor; override if needed
 SELECT tpcds.gen_query();
 
--- 5. Run the benchmark
+-- 5. Run the benchmark (uses the session's optimizer setting)
 SELECT tpcds.bench();
+
+-- Or save an EXPLAIN plan per query (default options: ANALYZE, VERBOSE, COSTS ON)
+SELECT tpcds.bench(explain_analyze := true);
+SELECT tpcds.bench(explain_opts := 'ANALYZE, VERBOSE, COSTS ON, BUFFERS OFF');
 
 -- View results
 SELECT tpcds.report();
@@ -239,7 +243,7 @@ Note: `DROP EXTENSION tpcds CASCADE` removes extension functions and internal ta
 | `tpcds.gen_data(scale_factor, parallel)` | Generate data on segments. `parallel` = dsdgen workers per segment |
 | `tpcds.load_data(workers)` | Load via gpfdist. `workers` = concurrent INSERT sessions |
 | `tpcds.gen_query(scale)` | Generate 99 queries with dsqgen |
-| `tpcds.bench(optimizer, timeout_sec, skip)` | Run all queries. `optimizer`: `'orca'`/`'postgres'`. `skip`: query IDs to skip |
+| `tpcds.bench(timeout_sec, skip, explain_analyze, explain_opts)` | Run all queries with the session's `optimizer` setting. `skip`: query IDs to skip. `explain_analyze`: run each query under `EXPLAIN` and save the plan to `results_dir/query<N>.out`. `explain_opts`: `EXPLAIN` options for that mode (default `'ANALYZE, VERBOSE, COSTS ON'`; setting it implies `explain_analyze`) |
 
 ### Inspection & Reporting
 

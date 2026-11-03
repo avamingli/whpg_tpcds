@@ -2504,6 +2504,23 @@ END;
 $func$;
 
 -- =============================================================================
+-- _explain_sql(stmt, opts) — wrap a statement in EXPLAIN with optional options
+--   opts: EXPLAIN option list without parentheses (e.g. 'ANALYZE, BUFFERS OFF');
+--         '' or NULL → plain EXPLAIN
+-- =============================================================================
+CREATE OR REPLACE FUNCTION tpcds._explain_sql(stmt TEXT, opts TEXT)
+RETURNS TEXT
+LANGUAGE plpgsql
+AS $func$
+BEGIN
+    IF opts <> '' THEN
+        RETURN format('EXPLAIN (%s) %s', opts, stmt);
+    END IF;
+    RETURN 'EXPLAIN ' || stmt;
+END;
+$func$;
+
+-- =============================================================================
 -- explain(qid, opts) — EXPLAIN a single query, return plan to client
 -- =============================================================================
 CREATE OR REPLACE FUNCTION tpcds.explain(qid INTEGER, opts TEXT DEFAULT '')
@@ -2514,7 +2531,6 @@ DECLARE
     _sql TEXT;
     _stmts TEXT[];
     _stmt TEXT;
-    _explain_sql TEXT;
     _line TEXT;
     _part INTEGER := 0;
     _num_stmts INTEGER;
@@ -2551,13 +2567,7 @@ BEGIN
             RETURN NEXT format('-- Statement %s of %s', _part, _num_stmts);
         END IF;
 
-        IF opts <> '' THEN
-            _explain_sql := format('EXPLAIN (%s) %s', opts, _stmt);
-        ELSE
-            _explain_sql := 'EXPLAIN ' || _stmt;
-        END IF;
-
-        FOR _line IN EXECUTE _explain_sql LOOP
+        FOR _line IN EXECUTE tpcds._explain_sql(_stmt, opts) LOOP
             RETURN NEXT _line;
         END LOOP;
     END LOOP;
@@ -2567,15 +2577,20 @@ END;
 $func$;
 
 -- =============================================================================
--- bench(optimizer, timeout_sec, skip) — run all 99 queries
---   optimizer: 'on' (ORCA), 'off' (Planner), NULL (inherit current)
+-- bench(timeout_sec, skip, explain_analyze, explain_opts) — run all 99 queries
+--   Optimizer is taken from the session (SET optimizer before calling)
 --   timeout_sec: per-query timeout in seconds
 --   skip: array of query_ids to skip
+--   explain_analyze: run each query under EXPLAIN and save the plan to the
+--                    result file instead of executing it directly
+--   explain_opts: EXPLAIN options for that mode (default 'ANALYZE, VERBOSE,
+--                 COSTS ON'); setting it implies explain_analyze
 -- =============================================================================
 CREATE OR REPLACE FUNCTION tpcds.bench(
     timeout_sec INTEGER DEFAULT NULL,
     skip INTEGER[] DEFAULT NULL,
-    explain_analyze BOOLEAN DEFAULT false
+    explain_analyze BOOLEAN DEFAULT false,
+    explain_opts TEXT DEFAULT NULL
 )
 RETURNS TEXT
 LANGUAGE plpgsql
@@ -2621,8 +2636,13 @@ BEGIN
     RAISE NOTICE 'bench: optimizer=% (%)',
         current_setting('optimizer', true), _optimizer_label;
 
+    IF explain_opts IS NOT NULL THEN
+        explain_analyze := true;
+    END IF;
+    explain_opts := coalesce(explain_opts, 'ANALYZE, VERBOSE, COSTS ON');
     IF explain_analyze THEN
-        RAISE NOTICE 'bench: EXPLAIN ANALYZE mode enabled (plans saved to result files)';
+        RAISE NOTICE 'bench: % mode enabled (plans saved to result files)',
+            rtrim(tpcds._explain_sql('', explain_opts));
     END IF;
     IF timeout_sec IS NOT NULL THEN
         RAISE NOTICE 'bench: per-query timeout: %s', timeout_sec;
@@ -2678,7 +2698,7 @@ BEGIN
                 _start_ts := clock_timestamp();
                 IF explain_analyze THEN
                     _plan_lines := '';
-                    FOR _plan_rec IN EXECUTE 'EXPLAIN (ANALYZE, VERBOSE, COSTS ON) ' || _stmt LOOP
+                    FOR _plan_rec IN EXECUTE tpcds._explain_sql(_stmt, explain_opts) LOOP
                         _plan_lines := _plan_lines || _plan_rec."QUERY PLAN" || E'\n';
                     END LOOP;
                     _dur := extract(epoch from clock_timestamp() - _start_ts) * 1000;
