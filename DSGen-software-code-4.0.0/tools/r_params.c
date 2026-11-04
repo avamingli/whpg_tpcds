@@ -46,7 +46,7 @@
 #include "tdefs.h"
 #include "release.h"
 
-#define PARAM_MAX_LEN	80
+#define PARAM_MAX_LEN	512
 
 #ifndef TEST
 extern option_t options[];
@@ -67,6 +67,22 @@ char *params[9];
 #endif
 
 static int param_init = 0;
+
+/*
+ * Copy a parameter value into its PARAM_MAX_LEN buffer, refusing values that
+ * do not fit rather than overrunning into the neighbouring parameters.
+ */
+static void
+copy_param(int nParam, char *val)
+{
+	if (strlen(val) >= PARAM_MAX_LEN)
+	{
+		fprintf(stderr, "ERROR: value of %s is longer than %d bytes: %s\n",
+			options[nParam].name, PARAM_MAX_LEN - 1, val);
+		exit(1);
+	}
+	strcpy(params[options[nParam].index], val);
+}
 
 #define MAX_LINE_LEN	120
 #ifdef WIN32
@@ -219,7 +235,7 @@ set_int(char *var, char *val)
 	nParam = fnd_param(var);
 	if (nParam >= 0)
 	{
-		strcpy(params[options[nParam].index], val);
+		copy_param(nParam, val);
 		options[nParam].flags |= OPT_SET;
 	}
 	return;
@@ -275,7 +291,7 @@ set_str(char *var, char *val)
 	nParam = fnd_param(var);
 	if (nParam >= 0)
 	{
-		strcpy(params[options[nParam].index], val);
+		copy_param(nParam, val);
 		options[nParam].flags |= OPT_SET;
 	}
 
@@ -338,7 +354,7 @@ init_params(void)
 	{
 		params[options[i].index] = (char *)malloc(PARAM_MAX_LEN * sizeof(char));
 		MALLOC_CHECK(params[options[i].index]);
-		strncpy(params[options[i].index], options[i].dflt, 80);
+		strncpy(params[options[i].index], options[i].dflt, PARAM_MAX_LEN);
 		if (*options[i].dflt)
 			options[i].flags |= OPT_DFLT;
 	}
@@ -880,7 +896,7 @@ load_param(int nParam, char *szValue)
 	if (options[nParam].flags & OPT_SET)		/* already set from the command line */
 		return(0);
 	else
-		strcpy(params[options[nParam].index], szValue);
+		copy_param(nParam, szValue);
 
 	return(0);
 }

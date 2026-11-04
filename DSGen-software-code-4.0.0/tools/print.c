@@ -439,7 +439,7 @@ int
 print_start (int tbl)
 {
    int res = 0;
-   char path[256];
+   char path[1024];
    tdef *pTdef = getSimpleTdefsByNumber(tbl);
 
 
@@ -560,7 +560,7 @@ int
 openDeleteFile(int bOpen)
 {
    int res = 0;
-   char path[256];
+   char path[1024];
    
    if (!bOpen)
       fclose(fpDeleteFile);

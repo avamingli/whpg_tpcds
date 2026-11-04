@@ -410,7 +410,11 @@ main (int ac, char **av)
 		nArgLength = strlen(av[i]) + 1;
 		if ((nCommandLineLength + nArgLength) >= 200)
 		{
-			ReportError(QERR_CMDLINE_TOO_LONG, NULL, 0);
+			/*
+			 * ReportError() needs a template file context that dsdgen does
+			 * not have; the arguments only feed dbgen_version, so truncate.
+			 */
+			fprintf(stderr, "WARNING: command line longer than 200 bytes, truncated in dbgen_version\n");
 			break;
 		}
 		strcat(g_szCommandLine, av[i]);
