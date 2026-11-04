@@ -305,6 +305,27 @@ END;
 $func$;
 
 -- =============================================================================
+-- _seg_data_dir(datadir, content) — directory holding one segment's .dat files
+--   If data_dir config set → {data_dir}/seg{content}; otherwise →
+--   {segment datadir}/dsgendata_tpcds
+-- =============================================================================
+CREATE OR REPLACE FUNCTION tpcds._seg_data_dir(p_datadir TEXT, p_content INTEGER)
+RETURNS TEXT
+LANGUAGE plpgsql
+AS $func$
+DECLARE
+    _val TEXT;
+BEGIN
+    SELECT value INTO _val FROM tpcds.config WHERE key = 'data_dir';
+    IF _val IS NOT NULL AND _val <> '' THEN
+        RETURN rtrim(_val, '/') || '/seg' || p_content;
+    END IF;
+    SELECT value INTO _val FROM tpcds.config WHERE key = 'data_subdir';
+    RETURN p_datadir || '/' || COALESCE(NULLIF(_val, ''), 'dsgendata_tpcds');
+END;
+$func$;
+
+-- =============================================================================
 -- config(key) — get config value
 -- config(key, value) — set config value (upsert)
 -- =============================================================================
@@ -1583,7 +1604,9 @@ DECLARE
     _num_segs     INTEGER;
     _total_par    INTEGER;
     _child        INTEGER := 1;
-    _data_subdir  TEXT := 'dsgendata_tpcds';
+    _seg_dir      TEXT;
+    _children     TEXT;
+    _failures     TEXT[] := '{}';
     _start_ts     TIMESTAMPTZ;
     _dsdgen_bin   TEXT;
     _tpcds_idx    TEXT;
@@ -1661,22 +1684,25 @@ BEGIN
             'set -e'
         ];
 
-        -- Create data directories for each segment on this host
+        -- Recreate data directories for each segment on this host; files left
+        -- by an earlier run would make dsdgen refuse to write
         FOR _rec IN
             SELECT g.content AS seg_id, g.datadir
             FROM gp_segment_configuration g
             WHERE g.content >= 0 AND g.role = 'p' AND g.hostname = _host
             ORDER BY g.content
         LOOP
-            _script_lines := _script_lines || format('mkdir -p %s/%s', _rec.datadir, _data_subdir);
+            _seg_dir := tpcds._seg_data_dir(_rec.datadir, _rec.seg_id);
+            _script_lines := _script_lines || format('rm -rf %s && mkdir -p %s', _seg_dir, _seg_dir);
 
-            -- Launch parallel dsdgen workers for this segment
+            -- Launch parallel dsdgen workers for this segment; each records
+            -- its output and exit status so failures can be reported below
             FOR _child IN (_rec.seg_id * parallel + 1) .. ((_rec.seg_id + 1) * parallel) LOOP
                 _script_lines := _script_lines || format(
-                    'cd %s/tools && ./dsdgen -scale %s -dir %s/%s -parallel %s -child %s -RNGSEED 2016032410 -terminate n > /dev/null 2>&1 &',
-                    _host_tmp, scale_factor,
-                    _rec.datadir, _data_subdir,
-                    _total_par, _child
+                    '(cd %s/tools && ./dsdgen -scale %s -dir %s -parallel %s -child %s -RNGSEED 2016032410 -terminate n > %s/dsdgen_%s_%s.log 2>&1 && echo 0 > %s/dsdgen_%s_%s.rc || echo $? > %s/dsdgen_%s_%s.rc) &',
+                    _host_tmp, scale_factor, _seg_dir, _total_par, _child,
+                    _host_tmp, _pid, _child, _host_tmp, _pid, _child,
+                    _host_tmp, _pid, _child
                 );
             END LOOP;
         END LOOP;
@@ -1737,9 +1763,50 @@ BEGIN
             round(extract(epoch from clock_timestamp() - _poll_start)::numeric, 0);
     END LOOP;
 
-    -- Clean up temp table and scripts
+    -- Check every dsdgen worker's exit status: a worker that fails (bad path,
+    -- existing files, ...) otherwise leaves its share of the data missing
+    -- without any error.
+    CREATE TEMP TABLE IF NOT EXISTS _dsdgen_chk (line TEXT) ON COMMIT DROP DISTRIBUTED RANDOMLY;
+    FOREACH _host IN ARRAY _seg_hosts LOOP
+        _host_tmp := tpcds._host_tmp_dir(_host);
+        SELECT string_agg(c::TEXT, ' ' ORDER BY c) INTO _children
+        FROM gp_segment_configuration g,
+             generate_series(g.content * parallel + 1, (g.content + 1) * parallel) c
+        WHERE g.content >= 0 AND g.role = 'p' AND g.hostname = _host;
+
+        _script_lines := ARRAY[
+            '#!/bin/bash',
+            format('cd %s', _host_tmp),
+            format('for c in %s; do', _children),
+            format('    rc=%s/dsdgen_%s_$c.rc; log=%s/dsdgen_%s_$c.log', _host_tmp, _pid, _host_tmp, _pid),
+            '    i=0; while [ ! -s $rc ] && [ $i -lt 20 ]; do sleep 0.5; i=$((i + 1)); done',
+            '    s=$(cat $rc 2>/dev/null)',
+            '    if [ "$s" != 0 ]; then',
+            '        echo "child $c exit ${s:-unknown}: $(grep -iv -e copyright -e ''population generator'' -e ''qualification only'' $log 2>/dev/null | tail -1 | tr -cd ''[:print:]'')"',
+            '    else',
+            '        rm -f $rc $log',
+            '    fi',
+            'done',
+            format('rm -f %s/tpcds_%s_dsdgen_*.sh', _host_tmp, _pid)
+        ];
+        _script_path := format('%s/tpcds_%s_dsdgen_check_%s.sh', _tmp_dir, _pid, _host);
+        EXECUTE format(
+            'COPY (SELECT line FROM unnest(%L::text[]) AS line) TO PROGRAM %L WITH (FORMAT text)',
+            _script_lines, 'cat > ' || _script_path
+        );
+        EXECUTE format('COPY (SELECT 1) TO PROGRAM %L',
+            format('scp -o StrictHostKeyChecking=no -q %s %s:%s/', _script_path, _host, _host_tmp));
+        TRUNCATE _dsdgen_chk;
+        EXECUTE format('COPY _dsdgen_chk FROM PROGRAM %L',
+            format('ssh -o StrictHostKeyChecking=no -n %s "bash %s/tpcds_%s_dsdgen_check_%s.sh"',
+                   _host, _host_tmp, _pid, _host));
+        SELECT _failures || array_agg(format('%s %s', _host, line)) INTO _failures FROM _dsdgen_chk;
+    END LOOP;
+
+    -- Clean up temp tables and scripts
     SET LOCAL client_min_messages = warning;
     DROP TABLE IF EXISTS _poll_out;
+    DROP TABLE IF EXISTS _dsdgen_chk;
     RESET client_min_messages;
 
     BEGIN
@@ -1748,11 +1815,17 @@ BEGIN
     EXCEPTION WHEN OTHERS THEN NULL;
     END;
 
+    IF cardinality(_failures) > 0 THEN
+        RAISE EXCEPTION 'gen_data: % of % dsdgen workers failed, data is incomplete',
+            cardinality(_failures), _total_par
+            USING DETAIL = array_to_string(_failures, E'\n'),
+                  HINT = 'Each worker''s output is kept next to its exit status as dsdgen_<pid>_<child>.log in the host tmp_dir.';
+    END IF;
+
     -- Save config
     PERFORM tpcds.config('scale_factor', scale_factor::TEXT);
     PERFORM tpcds.config('parallel', parallel::TEXT);
     PERFORM tpcds.config('total_parallel', _total_par::TEXT);
-    PERFORM tpcds.config('data_subdir', _data_subdir);
 
     RAISE NOTICE 'gen_data: completed in % seconds',
         round(extract(epoch from clock_timestamp() - _start_ts)::numeric, 1);
@@ -1783,7 +1856,7 @@ DECLARE
         'inventory','catalog_returns','web_returns','web_sales',
         'catalog_sales','store_sales'
     ];
-    _data_subdir  TEXT;
+    _seg_dir      TEXT;
     _delete_after_load BOOLEAN := false;
     _rm_lines     TEXT[] := ARRAY[]::TEXT[];
     _stop_lines   TEXT[] := ARRAY[]::TEXT[];
@@ -1850,13 +1923,6 @@ BEGIN
         WHEN OTHERS THEN NULL;  -- env check failed, proceed anyway
     END;
 
-    -- Resolve config
-    SELECT COALESCE(NULLIF(value, ''), 'dsgendata_tpcds') INTO _data_subdir
-    FROM tpcds.config WHERE key = 'data_subdir';
-    IF _data_subdir IS NULL THEN
-        _data_subdir := 'dsgendata_tpcds';
-    END IF;
-
     -- delete_after_load: remove a table's .dat files on every segment as soon
     -- as that table is loaded, so the generated flat files and the loaded
     -- tables never have to fit on disk at the same time.
@@ -1866,7 +1932,7 @@ BEGIN
     IF _delete_after_load THEN
         FOR _rec IN
             SELECT g.hostname,
-                   string_agg(format('%s/%s/${1}_[0-9]*_[0-9]*.dat', g.datadir, _data_subdir),
+                   string_agg(format('%s/${1}_[0-9]*_[0-9]*.dat', tpcds._seg_data_dir(g.datadir, g.content)),
                               ' ' ORDER BY g.content) AS globs
             FROM gp_segment_configuration g
             WHERE g.content >= 0 AND g.role = 'p'
@@ -1961,13 +2027,14 @@ BEGIN
             WHERE g.content >= 0 AND g.role = 'p' AND g.hostname = _host
             ORDER BY g.content
         LOOP
-            -- Touch empty sentinel .dat for tables missing from this segment's datadir
+            _seg_dir := tpcds._seg_data_dir(_rec.datadir, _rec.seg_id);
+
+            -- Touch empty sentinel .dat for tables missing from this segment's data dir
             -- (small tables like reason, income_band only exist on certain segments)
             _gpfdist_lines := _gpfdist_lines || ARRAY[format(
-                'for t in %s; do f=$(ls %s/%s/${t}_[0-9]*_[0-9]*.dat 2>/dev/null | head -1); [ -n "$f" ] || touch %s/%s/${t}_0_0.dat; done',
+                'for t in %s; do f=$(ls %s/${t}_[0-9]*_[0-9]*.dat 2>/dev/null | head -1); [ -n "$f" ] || touch %s/${t}_0_0.dat; done',
                 array_to_string(_tables, ' '),
-                _rec.datadir, _data_subdir,
-                _rec.datadir, _data_subdir)];
+                _seg_dir, _seg_dir)];
 
             -- Auto-select port with retry. Skip ports held by any local TCP socket,
             -- not just listeners: the base port can fall inside ip_local_port_range
@@ -1982,8 +2049,8 @@ BEGIN
                 '        PORT=$((PORT + 1))',
                 '        continue',
                 '    fi',
-                format('    nohup gpfdist -d %s/%s -p $PORT </dev/null >%s/gpfdist_seg%s_%s.log 2>&1 &',
-                       _rec.datadir, _data_subdir, _host_tmp, _rec.seg_id, _pid),
+                format('    nohup gpfdist -d %s -p $PORT </dev/null >%s/gpfdist_seg%s_%s.log 2>&1 &',
+                       _seg_dir, _host_tmp, _rec.seg_id, _pid),
                 '    GPID=$!',
                 '    for i in $(seq 1 50); do',
                 format('        if (exec 3<>/dev/tcp/%s/$PORT) 2>/dev/null; then OK=1; break; fi', _host),
@@ -2306,6 +2373,10 @@ BEGIN
     SELECT sum(reltuples::BIGINT) INTO _total_rows
     FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid
     WHERE n.nspname = 'tpcds' AND c.relname = ANY(_tables);
+
+    IF coalesce(_total_rows, 0) <= 0 THEN
+        RAISE EXCEPTION 'load_data: no rows were loaded. Check that gen_data produced .dat files. Log: %', _logfile;
+    END IF;
 
     RETURN format('Loaded ~%s rows in %s sec (workers=%s). Log: %s',
         _total_rows,
@@ -2932,18 +3003,11 @@ RETURNS TEXT
 LANGUAGE plpgsql
 AS $func$
 DECLARE
-    _data_subdir TEXT;
     _rec RECORD;
     _host TEXT;
     _seg_hosts TEXT[];
     _cmd TEXT;
 BEGIN
-    SELECT COALESCE(NULLIF(value, ''), 'dsgendata_tpcds') INTO _data_subdir
-    FROM tpcds.config WHERE key = 'data_subdir';
-    IF _data_subdir IS NULL THEN
-        _data_subdir := 'dsgendata_tpcds';
-    END IF;
-
     -- Get segment hosts
     SELECT array_agg(DISTINCT hostname ORDER BY hostname) INTO _seg_hosts
     FROM gp_segment_configuration
@@ -2951,14 +3015,14 @@ BEGIN
 
     -- Remove data directories on each segment
     FOR _rec IN
-        SELECT g.hostname, g.datadir
+        SELECT g.hostname, tpcds._seg_data_dir(g.datadir, g.content) AS seg_dir
         FROM gp_segment_configuration g
         WHERE g.content >= 0 AND g.role = 'p'
         ORDER BY g.content
     LOOP
         BEGIN
-            _cmd := format('ssh -o StrictHostKeyChecking=no -n %s "rm -rf %s/%s"',
-                          _rec.hostname, _rec.datadir, _data_subdir);
+            _cmd := format('ssh -o StrictHostKeyChecking=no -n %s "rm -rf %s"',
+                          _rec.hostname, _rec.seg_dir);
             EXECUTE format('COPY (SELECT 1) TO PROGRAM %L', _cmd);
         EXCEPTION WHEN OTHERS THEN
             RAISE WARNING 'Could not clean data on %: %', _rec.hostname, SQLERRM;
