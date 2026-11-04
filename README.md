@@ -150,9 +150,18 @@ Inspect, run, or explain any single query by ID:
  where ctr1.ctr_total_return > (select avg(ctr_total_return)*1.2 ...)
  order by c_customer_id limit 100;
 
--- Execute a single query and see timing
-=# SELECT tpcds.exec(1);
- query 1: OK, 1803.91 ms, 100 rows
+-- Execute a single query: result rows (as JSON) and timing per statement
+=# SELECT * FROM tpcds.exec(1);
+ {"c_customer_id":"AAAAAAAAAAAABAAA"}
+ {"c_customer_id":"AAAAAAAAAAAEAAAA"}
+ ...
+ -- (100 rows, 303.51 ms)
+
+-- Or run it straight from psql (psql before 15 shows only the last
+-- result of the two-statement queries 14, 23, 24 and 39)
+=# \timing on
+=# SET search_path = tpcds, public;
+=# SELECT tpcds.show(1) \gexec
 
 -- Show the query plan (supports ANALYZE, BUFFERS, etc.)
 =# SELECT tpcds.explain(1);
@@ -252,7 +261,7 @@ Note: `DROP EXTENSION tpcds CASCADE` removes extension functions and internal ta
 | `tpcds.report()` | Text summary of latest benchmark run |
 | `tpcds.gen_chart()` | Generate PNG bar chart and CSV export |
 | `tpcds.show(qid)` | Display the SQL text of a query |
-| `tpcds.exec(qid)` | Execute a single query and return timing |
+| `tpcds.exec(qid)` | Execute a single query, return its rows and timing |
 | `tpcds.explain(qid, opts)` | Show query plan (e.g. `'ANALYZE, BUFFERS'`) |
 
 ### Configuration

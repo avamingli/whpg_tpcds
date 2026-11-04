@@ -2449,6 +2449,9 @@ DECLARE
     _num_stmts INTEGER;
     _rec RECORD;
     _row_num BIGINT;
+    _start_ts TIMESTAMPTZ;
+    _dur NUMERIC;
+    _total_dur NUMERIC := 0;
     _saved_path TEXT;
 BEGIN
     SELECT query_text INTO _sql FROM tpcds.query WHERE query_id = qid;
@@ -2482,22 +2485,24 @@ BEGIN
             RETURN NEXT format('-- Statement %s of %s', _part, _num_stmts);
         END IF;
 
-        -- Use CREATE TEMP TABLE AS so row_to_json can serialize each result
-        -- row generically, without knowing the query's column list upfront.
-        -- Suppress "schema pg_temp does not exist" notices on segments.
-        PERFORM set_config('client_min_messages', 'warning', false);
-        EXECUTE 'DROP TABLE IF EXISTS _tpcds_exec_tmp';
-        PERFORM set_config('client_min_messages', 'notice', false);
-        EXECUTE 'CREATE TEMP TABLE _tpcds_exec_tmp AS ' || _stmt;
-        GET DIAGNOSTICS _row_num = ROW_COUNT;
-
-        FOR _rec IN SELECT row_to_json(t)::TEXT AS line FROM _tpcds_exec_tmp t LOOP
-            RETURN NEXT _rec.line;
+        -- Run the statement as is, so it gets the same plan and row order as
+        -- when sent from a client; row_to_json() serializes the RECORD
+        -- variable without knowing the column list upfront.
+        _row_num := 0;
+        _start_ts := clock_timestamp();
+        FOR _rec IN EXECUTE _stmt LOOP
+            RETURN NEXT row_to_json(_rec)::TEXT;
+            _row_num := _row_num + 1;
         END LOOP;
-        EXECUTE 'DROP TABLE _tpcds_exec_tmp';
+        _dur := extract(epoch from clock_timestamp() - _start_ts) * 1000;
+        _total_dur := _total_dur + _dur;
 
-        RETURN NEXT format('-- (%s rows)', _row_num);
+        RETURN NEXT format('-- (%s rows, %s ms)', _row_num, round(_dur, 2));
     END LOOP;
+
+    IF _num_stmts > 1 THEN
+        RETURN NEXT format('-- Total: %s ms', round(_total_dur, 2));
+    END IF;
 
     PERFORM set_config('search_path', _saved_path, false);
 END;
